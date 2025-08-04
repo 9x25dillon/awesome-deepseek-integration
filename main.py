@@ -14,8 +14,9 @@ from pdfminer.high_level import extract_text as extract_pdf_text
 from docx import Document
 from PIL import Image
 import pytesseract
-from models import RAGRequest
-from utils import retrieve_relevant_docs, build_augmented_prompt
+from models import RAGRequest, RAGResponse, PolynomialAnalysisRequest, PolynomialAnalysisResponse
+from utils import retrieve_relevant_docs, build_augmented_prompt, extract_polynomial_features
+from julia_client import julia_client
 
 app = FastAPI()
 
@@ -176,6 +177,12 @@ async def run_rag(request: RAGRequest):
         
         # Generate response using OpenAI
         openai.api_key = os.getenv("OPENAI_API_KEY")
+        if not openai.api_key:
+            return JSONResponse(
+                status_code=500, 
+                content={"error": "OpenAI API key not configured"}
+            )
+        
         response = openai.ChatCompletion.create(
             model="gpt-4",
             messages=[
@@ -190,10 +197,63 @@ async def run_rag(request: RAGRequest):
             "answer": response.choices[0].message.content.strip(),
             "context": context,
             "query": request.query,
-            "top_k": request.top_k
+            "top_k": request.top_k,
+            "polynomial_analysis_used": request.use_polynomial_analysis
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/analyze_polynomials", response_model=PolynomialAnalysisResponse)
+async def analyze_polynomials(request: PolynomialAnalysisRequest):
+    """
+    Endpoint for direct polynomial analysis using Julia backend
+    """
+    try:
+        if julia_client.is_available() and request.analysis_type == "advanced":
+            # Use Julia for advanced analysis
+            analysis_result = julia_client.analyze_polynomials(request.polynomials)
+            if analysis_result:
+                return PolynomialAnalysisResponse(
+                    results=[
+                        {
+                            "expression": poly["expression"],
+                            "degree": poly["degree"],
+                            "term_count": poly["term_count"],
+                            "variables": poly["variables"],
+                            "complexity_score": poly["complexity_score"]
+                        }
+                        for poly in analysis_result["polynomials"]
+                    ],
+                    analysis_metadata={"julia_backend": True, "analysis_type": request.analysis_type}
+                )
+        
+        # Fallback to Python-based analysis
+        results = []
+        for poly_expr in request.polynomials:
+            features = extract_polynomial_features(poly_expr)
+            results.append({
+                "expression": poly_expr,
+                "degree": features["degree"],
+                "term_count": features["term_count"],
+                "variables": features["variables"],
+                "complexity_score": features["complexity_score"]
+            })
+        
+        return PolynomialAnalysisResponse(
+            results=results,
+            analysis_metadata={"julia_backend": False, "analysis_type": "basic"}
+        )
+        
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/julia_status")
+def julia_status():
+    """Check if Julia backend is available"""
+    return {
+        "julia_available": julia_client.is_available(),
+        "status": "Julia backend is ready" if julia_client.is_available() else "Julia backend unavailable, using Python fallback"
+    }
 
 @app.get("/export/jsonl")
 def export_as_jsonl(chunks: List[str] = Form(...)):

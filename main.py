@@ -14,9 +14,11 @@ from pdfminer.high_level import extract_text as extract_pdf_text
 from docx import Document
 from PIL import Image
 import pytesseract
-from models import RAGRequest, RAGResponse, PolynomialAnalysisRequest, PolynomialAnalysisResponse
+from models import RAGRequest, RAGResponse, PolynomialAnalysisRequest, PolynomialAnalysisResponse, EntropyProcessingRequest, EntropyProcessingResponse, EntropyRAGRequest
 from utils import retrieve_relevant_docs, build_augmented_prompt, extract_polynomial_features
 from julia_client import julia_client
+from core import Token, EntropyNode, EntropyEngine
+from entropy_cli import create_polynomial_transformations
 
 app = FastAPI()
 
@@ -253,6 +255,181 @@ def julia_status():
     return {
         "julia_available": julia_client.is_available(),
         "status": "Julia backend is ready" if julia_client.is_available() else "Julia backend unavailable, using Python fallback"
+    }
+
+@app.post("/entropy_process", response_model=EntropyProcessingResponse)
+async def process_with_entropy_engine(request: EntropyProcessingRequest):
+    """
+    Process input through entropy engine with polynomial transformations
+    """
+    try:
+        # Create token
+        token = Token(request.input_value)
+        
+        # Get available transformations
+        transforms = create_polynomial_transformations()
+        
+        # Build transformation nodes
+        root_node = None
+        current_node = None
+        
+        for i, transform_name in enumerate(request.transformations):
+            if transform_name not in transforms:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Unknown transformation: {transform_name}"}
+                )
+            
+            # Apply entropy limit if provided
+            entropy_limit = None
+            if request.entropy_limits and i < len(request.entropy_limits):
+                entropy_limit = request.entropy_limits[i]
+            
+            node = EntropyNode(f"node_{i}_{transform_name}", transforms[transform_name], entropy_limit)
+            
+            if root_node is None:
+                root_node = node
+                current_node = node
+            else:
+                current_node.add_child(node)
+                current_node = node
+        
+        if root_node is None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "No valid transformations provided"}
+            )
+        
+        # Process through entropy engine
+        engine = EntropyEngine(root_node, max_depth=request.max_depth)
+        processed_token = engine.run(token)
+        
+        # Julia analysis if requested
+        julia_analysis = None
+        if request.use_julia and julia_client.is_available() and token.token_type == "polynomial":
+            try:
+                julia_analysis = julia_client.analyze_polynomials([processed_token.current_value])
+            except:
+                pass
+        
+        return EntropyProcessingResponse(
+            input_value=request.input_value,
+            final_value=processed_token.current_value,
+            input_type=processed_token.token_type,
+            entropy_change=processed_token.current_entropy - processed_token.initial_entropy,
+            entropy_trend=processed_token.entropy_trend(),
+            transformations_applied=len(processed_token.transformations),
+            processing_graph=engine.export_graph(),
+            polynomial_features=processed_token.polynomial_features,
+            julia_analysis=julia_analysis
+        )
+        
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/entropy_rag")
+async def entropy_enhanced_rag(request: EntropyRAGRequest):
+    """
+    Enhanced RAG with entropy-based query processing
+    """
+    try:
+        # First, process the query through entropy engine if transformations specified
+        processed_query = request.query
+        entropy_analysis = None
+        
+        if request.entropy_transformations:
+            # Process query through entropy engine
+            entropy_request = EntropyProcessingRequest(
+                input_value=request.query,
+                transformations=request.entropy_transformations,
+                max_depth=3,  # Limit depth for query processing
+                use_julia=True
+            )
+            
+            # Get internal entropy processing response
+            entropy_result = await process_with_entropy_engine(entropy_request)
+            if hasattr(entropy_result, 'final_value'):
+                processed_query = entropy_result.final_value
+                entropy_analysis = {
+                    "original_query": request.query,
+                    "processed_query": processed_query,
+                    "entropy_change": entropy_result.entropy_change,
+                    "transformations": request.entropy_transformations
+                }
+        
+        # Apply entropy threshold filtering if specified
+        context_docs = retrieve_relevant_docs(
+            processed_query, 
+            k=request.top_k,
+            use_polynomial_analysis=request.use_polynomial_analysis
+        )
+        
+        # Filter by entropy threshold if specified
+        if request.entropy_threshold is not None:
+            filtered_docs = []
+            for doc in context_docs:
+                doc_token = Token(doc)
+                if doc_token.current_entropy >= request.entropy_threshold:
+                    filtered_docs.append(doc)
+            context_docs = filtered_docs[:request.top_k]
+        
+        # Build augmented prompt
+        augmented_prompt = build_augmented_prompt(processed_query, context_docs)
+        
+        # Generate AI response
+        openai.api_key = os.getenv("OPENAI_API_KEY")
+        if not openai.api_key:
+            return JSONResponse(
+                status_code=500, 
+                content={"error": "OpenAI API key not configured"}
+            )
+        
+        response = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {
+                    "role": "system", 
+                    "content": "You are a mathematical assistant specializing in polynomial analysis with entropy-aware processing. Use the provided polynomial documents and entropy analysis to give accurate, detailed answers."
+                },
+                {"role": "user", "content": augmented_prompt}
+            ],
+            temperature=0.3,
+            max_tokens=1000,
+        )
+        
+        return {
+            "answer": response.choices[0].message.content.strip(),
+            "context": context_docs,
+            "original_query": request.query,
+            "processed_query": processed_query,
+            "entropy_analysis": entropy_analysis,
+            "entropy_threshold_applied": request.entropy_threshold,
+            "top_k": len(context_docs),
+            "polynomial_analysis_used": request.use_polynomial_analysis
+        }
+        
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/entropy_transformations")
+def list_entropy_transformations():
+    """List available entropy transformations"""
+    transforms = create_polynomial_transformations()
+    
+    polynomial_specific = [
+        "expand", "factor", "add_variable", "increase_degree", 
+        "substitute", "differentiate", "add_constant", "normalize"
+    ]
+    
+    general_transforms = [
+        "reverse", "uppercase", "lowercase", "duplicate", 
+        "add_random", "add_entropy", "truncate", "multiply"
+    ]
+    
+    return {
+        "polynomial_transformations": [name for name in polynomial_specific if name in transforms],
+        "general_transformations": [name for name in general_transforms if name in transforms],
+        "total_available": len(transforms)
     }
 
 @app.get("/export/jsonl")

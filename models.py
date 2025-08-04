@@ -34,3 +34,31 @@ class PolynomialAnalysisResponse(BaseModel):
     """Response model for polynomial analysis"""
     results: List[PolynomialDocument]
     analysis_metadata: Optional[dict] = None
+
+class EntropyProcessingRequest(BaseModel):
+    """Request model for entropy engine processing"""
+    input_value: str
+    transformations: List[str]
+    max_depth: Optional[int] = 5
+    entropy_limits: Optional[List[float]] = None
+    use_julia: Optional[bool] = True
+
+class EntropyProcessingResponse(BaseModel):
+    """Response model for entropy engine processing"""
+    input_value: str
+    final_value: str
+    input_type: str
+    entropy_change: float
+    entropy_trend: str
+    transformations_applied: int
+    processing_graph: dict
+    polynomial_features: Optional[dict] = None
+    julia_analysis: Optional[dict] = None
+
+class EntropyRAGRequest(BaseModel):
+    """Request model for entropy-enhanced RAG"""
+    query: str
+    entropy_transformations: Optional[List[str]] = None
+    top_k: Optional[int] = 3
+    use_polynomial_analysis: Optional[bool] = True
+    entropy_threshold: Optional[float] = None
